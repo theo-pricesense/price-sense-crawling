@@ -64,50 +64,113 @@ Price Sense B2B SaaS 서비스의 핵심 구성요소인 Python 기반 크롤링
 
 ## 4. 데이터베이스 연동
 
-### 4.1 직접 저장 테이블
+### 4.1 공유 데이터베이스 구조
 
-#### price_history
-```sql
-CREATE TABLE price_history (
-    id SERIAL PRIMARY KEY,
-    product_id INTEGER REFERENCES products(id),
-    price DECIMAL(12,2) NOT NULL,
-    discount_rate DECIMAL(5,2),
-    promotion_info TEXT,
-    confidence_score DECIMAL(3,2) NOT NULL,
-    recorded_at TIMESTAMP DEFAULT NOW()
-);
+크롤러는 NestJS API 서버와 PostgreSQL 데이터베이스를 공유합니다.
+
+#### 읽기 전용 테이블
+- **products**: 크롤링 대상 상품 정보 조회
+- **product_categories**: 상품 카테고리 정보 참조  
+- **product_groups**: 상품 그룹 정보 참조
+- **users**: 사용자 정보 참조 (권한 확인)
+
+#### 쓰기 전용 테이블
+- **price_history**: 가격 변동 데이터 저장
+- **stock_history**: 재고 변동 데이터 저장
+- **product_scrape_logs**: 크롤링 실행 로그 저장
+
+### 4.2 SQLAlchemy 모델
+
+프로젝트에서 사용하는 주요 모델:
+
+```python
+# models/base.py - 기본 클래스 및 Enum 정의
+class PlatformType(str, Enum):
+    COUPANG = "coupang"
+    NAVER_SHOPPING = "naver_shopping" 
+    ELEVEN_ST = "eleven_st"
+    SMART_STORE = "smart_store"
+
+class StockStatus(str, Enum):
+    AVAILABLE = "available"
+    LIMITED = "limited"
+    CRITICAL = "critical"
+    OUT_OF_STOCK = "out_of_stock"
+    PREORDER = "preorder"
+    UNKNOWN = "unknown"
+
+# models/product.py - 상품 모델
+class Product(Base, BaseModel):
+    user_id: Mapped[str]
+    platform: Mapped[PlatformType]
+    url: Mapped[str]
+    name: Mapped[str]
+    current_price: Mapped[Optional[Decimal]]
+    stock_status: Mapped[StockStatus]
+    # ... 기타 필드
+
+# models/price_history.py - 가격 이력
+class PriceHistory(Base):
+    product_id: Mapped[str]
+    price: Mapped[Decimal]
+    confidence_score: Mapped[Decimal]
+    recorded_at: Mapped[datetime]
+
+# models/stock_history.py - 재고 이력  
+class StockHistory(Base):
+    product_id: Mapped[str]
+    stock_status: Mapped[StockStatus]
+    confidence_score: Mapped[Decimal]
+    recorded_at: Mapped[datetime]
 ```
 
-#### stock_history
-```sql
-CREATE TABLE stock_history (
-    id SERIAL PRIMARY KEY,
-    product_id INTEGER REFERENCES products(id),
-    stock_status VARCHAR(20) NOT NULL, -- available/out_of_stock/limited
-    stock_quantity INTEGER,
-    confidence_score DECIMAL(3,2) NOT NULL,
-    recorded_at TIMESTAMP DEFAULT NOW()
-);
+### 4.3 데이터 저장 패턴
+
+```python
+# 크롤링 결과 저장 예시
+def save_crawl_result(product_id: str, scraped_data: dict):
+    session = SessionLocal()
+    try:
+        # 가격 이력 저장
+        price_record = PriceHistory(
+            product_id=product_id,
+            price=scraped_data['price'],
+            confidence_score=scraped_data['confidence'],
+            recorded_at=datetime.utcnow()
+        )
+        
+        # 재고 이력 저장
+        stock_record = StockHistory(
+            product_id=product_id,
+            stock_status=scraped_data['stock_status'],
+            confidence_score=scraped_data['confidence'],
+            recorded_at=datetime.utcnow()
+        )
+        
+        session.add_all([price_record, stock_record])
+        session.commit()
+        
+    except Exception as e:
+        session.rollback()
+        # 에러 로그 저장
+        error_log = ProductScrapeLog(
+            product_id=product_id,
+            status="failed",
+            error_message=str(e)
+        )
+        session.add(error_log)
+        session.commit()
+    finally:
+        session.close()
 ```
 
-#### crawl_logs
-```sql
-CREATE TABLE crawl_logs (
-    id SERIAL PRIMARY KEY,
-    product_id INTEGER REFERENCES products(id),
-    platform VARCHAR(50) NOT NULL,
-    status VARCHAR(20) NOT NULL, -- success/failed/partial
-    error_message TEXT,
-    execution_time INTEGER, -- 밀리초
-    created_at TIMESTAMP DEFAULT NOW()
-);
-```
+### 4.4 성능 최적화
+- **배치 처리**: 100개 단위로 대량 삽입
+- **연결 풀링**: SQLAlchemy 연결 풀 활용
+- **트랜잭션 관리**: 원자적 데이터 저장
+- **인덱스 활용**: 조회 성능 최적화
 
-### 4.2 배치 처리
-- 수집된 데이터를 배치 단위로 DB 삽입 (100개씩)
-- 트랜잭션 기반 원자적 처리
-- 연결 풀링으로 DB 부하 최적화
+자세한 데이터베이스 연동 가이드는 `docs/DATABASE.md`를 참조하세요.
 
 ## 5. Redis 큐 프로토콜
 
